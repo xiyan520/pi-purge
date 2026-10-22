@@ -1,0 +1,33 @@
+{
+  "name": "pi-purge",
+  "version": "0.3.3",
+  "private": true,
+  "type": "module",
+  "description": "pi 扩展：把 dsh-purge 的指令权威性清洗规则移植过来，让 pi 不拒答（规则注入 + 历史清洗 + 拒答续跑），并附带 25 个 redteam-* 技能与 rt 落库 CLI",
+  "keywords": [
+    "pi",
+    "extension",
+    "pi-purge",
+    "prompt",
+    "skills",
+    "redteam"
+  ],
+  "pi": {
+    "extensions": [
+      "index.ts"
+    ],
+    "skills": [
+      "skills"
+    ]
+  },
+  "main": "index.ts",
+  "scripts": {
+    "test": "node --test test/*.test.ts",
+    "verify": "node scripts/verify-load.mjs",
+    "verify:skills": "node scripts/verify-skills.mjs",
+    "e2e": "node verify/e2e.mjs",
+    "verify:stops": "node verify/probe-stops.mjs",
+    "verify:discovery": "node scripts/verify-skills-discovery.mjs"
+  },
+  "license": "MIT"
+}

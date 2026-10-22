@@ -1,0 +1,21 @@
+{
+  "$schema": "https://pi.dev/schemas/models.schema.json",
+  "providers": {
+    "stub": {
+      "baseUrl": "http://127.0.0.1:53345/v1",
+      "api": "openai-completions",
+      "apiKey": "stub-key",
+      "models": [
+        {
+          "id": "stub-1",
+          "name": "Stub Model",
+          "contextWindow": 32000,
+          "maxTokens": 1024,
+          "input": [
+            "text"
+          ]
+        }
+      ]
+    }
+  }
+}
