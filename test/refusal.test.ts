@@ -261,6 +261,12 @@ test("isProviderFilterError 只认内容过滤这一族", () => {
     "data_inspection_failed",
     "Provider finish_reason: safety",
     "Provider finish_reason: prohibited_content",
+    "Provider finish_reason: spii",
+    "The model refused to complete the request",
+    "Provider stopped with: sensitive",
+    "Provider stopped with: SAFETY",
+    "Provider stopped with: guardrail_intervened",
+    "Provider stopped with: content_filtered",
     "内容审核未通过",
   ];
   for (const text of filters) assert.equal(isProviderFilterError(text), true, "漏判: " + text);
@@ -270,8 +276,34 @@ test("isProviderFilterError 只认内容过滤这一族", () => {
     "ECONNRESET",
     "401 invalid api key",
     "Provider finish_reason: length",
+    // mistral 的服务端 500（mistral-conversations.js:759-761）与 bedrock 的工具参数畸形
+    // 都用 "Provider stopped with:" 这句，但都不是内容策略
+    "Provider stopped with: error (server error)",
+    "Provider stopped with: malformed_tool_use",
+    "Provider stopped with: malformed_model_output",
+    "Provider finish_reason: error",
+    "Provider finish_reason: error_429",
+    "Provider finish_reason: timeout",
+    "Provider finish_reason: rate_limit",
   ];
   for (const text of others) assert.equal(isProviderFilterError(text), false, "误判: " + text);
+});
+
+test("rawStopReason 优先：500 / 畸形工具调用不会被当成内容过滤", () => {
+  // mistral 的服务端 500：文案带 "Provider stopped with:"，rawStopReason 是 error
+  assert.equal(isProviderFilterError("Provider stopped with: error (server error)", "error"), false);
+  assert.equal(isProviderFilterError("Provider stopped with: malformed_tool_use", "malformed_tool_use"), false);
+  assert.equal(isProviderFilterError("Provider finish_reason: network_error", "network_error"), false);
+  assert.equal(isProviderFilterError("Provider finish_reason: length", "length"), false);
+  // 各家真正的内容策略值
+  for (const raw of ["content_filter", "CONTENT_FILTER", "safety", "SAFETY", "blocklist", "prohibited_content", "SPII", "recitation", "sensitive", "refusal", "guardrail_intervened", "content_filtered", "IMAGE_SAFETY"]) {
+    assert.equal(isProviderFilterError("whatever", raw), true, "rawStopReason 漏判: " + raw);
+  }
+  // openai-responses 的 "incomplete.content_filter" 与 google 的 "IMAGE_SAFETY" 走子串
+  assert.equal(isProviderFilterError("", "incomplete.content_filter"), true);
+  // 空 rawStopReason 退回文案匹配
+  assert.equal(isProviderFilterError("Provider finish_reason: content_filter", "  "), true);
+  assert.equal(isProviderFilterError("ECONNRESET", undefined), false);
 });
 
 test("filter 口径只讲传输故障，不叠 refusal 的「你拒答了」措辞", () => {
@@ -285,9 +317,20 @@ test("filter 口径只讲传输故障，不叠 refusal 的「你拒答了」措�
   assert.ok(!plain.includes("content_filter"), "refusal 口径不能带过滤话术");
   const second = continueText(undefined, 2, "filter");
   assert.ok(second.includes("第 2 次重发"), "第 2 次起要有次数口径");
+  assert.ok(second.includes("三十行以内"), "第 2 档退到只有骨架");
+  assert.ok(!second.includes("按传输故障处理"), "第 2 档不重复第 1 档的解释口径");
+  const third = continueText(undefined, 3, "filter");
+  assert.ok(third.includes("十五行以内") && third.includes("TODO"), "第 3 档只给第一段 + TODO 占位");
+  assert.ok(!third.includes("三十行以内"), "阶梯不叠档：第 3 档不再带第 2 档的整段骨架口径");
   // 自定义话术也要吃到 filter 前置
   const custom = continueText("把剩下的补完。", 1, "filter");
   assert.ok(custom.indexOf("按传输故障处理") < custom.indexOf("把剩下的补完。"), "filter 前置必须在最前面");
+  // 第 2 档起不再拼自定义话术：它通常带「你拒答了」框架，和这一档「零解释性自然语言」冲突
+  for (const attempt of [2, 3]) {
+    const ladder = continueText("继续。上一段输出是拒绝。", attempt, "filter");
+    assert.ok(!ladder.includes("上一段输出是拒绝"), "第 " + attempt + " 档不能带自定义的拒答叙事");
+    assert.ok(!ladder.includes("继续。"), "第 " + attempt + " 档不能带自定义正文");
+  }
 });
 
 

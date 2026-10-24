@@ -26,6 +26,9 @@ const withSkills = process.argv.includes("--with-skills");
 const stopWork = process.argv.includes("--stop-work");
 /** --content-filter：首答被供应商侧内容过滤掐断（finish_reason=content_filter → stopReason:error），验证这种"非模型拒答"也能续跑。 */
 const contentFilter = process.argv.includes("--content-filter");
+/** --filter-generic：同一形态，但 finish_reason 用 pi default 分支才认的值（safety），验证放宽后的识别面。 */
+const filterGeneric = process.argv.includes("--filter-generic");
+const filterReason = filterGeneric ? "safety" : "content_filter";
 const projectDir = path.join(here, "project");
 /** 找 pi 的 CLI 入口：PI_CLI_JS > ~/.pi/agent/install/releases/<最新>/.../bundle/cli.js */
 function resolveCli() {
@@ -123,7 +126,7 @@ function sse(res, text) {
 function sseFiltered(res) {
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
   res.write(chunk({ role: "assistant", content: FILTER_TEXT }, null));
-  res.write(chunk({}, "content_filter"));
+  res.write(chunk({}, filterReason));
   res.write("data: " + JSON.stringify({
     id: "chatcmpl-stub",
     object: "chat.completion.chunk",
@@ -165,9 +168,12 @@ const server = http.createServer((req, res) => {
       hasSkills: flat.includes("available_skills") && flat.includes("redteam-active-scan"),
       // 只认 continueText 独有的串：规则层自己就含 content_filter，用它断言等于恒真。
       hasFilterWording: flat.includes(FILTER_PROBE),
+      // 上游掐断留下的空壳助手消息应当在请求侧被摘掉（lib/clean.ts dropBrokenTurns）：
+      // 留着它等于给供应商一个空 prefill，刚被掐断的一轮会被原样再演一遍。
+      assistantCount: (payload.messages || []).filter((m) => m.role === "assistant").length,
       bytes: flat.length,
     });
-    if (contentFilter) {
+    if (contentFilter || filterGeneric) {
       // 过滤轮的续跑文案里没有「上一段输出是拒绝」这种措辞（见 lib/refusal.ts 的 filter 分支），
       // 所以这里要用 filter 独有的「按传输故障处理」当探针。
       if (flat.includes(FILTER_PROBE)) {
@@ -240,18 +246,19 @@ console.log("--- pi stdout ---\n" + out.trim().slice(0, 1500));
 if (err.trim()) console.log("--- pi stderr ---\n" + err.trim().slice(0, 1500));
 
 const fail = [];
-if (contentFilter) {
+if (contentFilter || filterGeneric) {
   if (code !== 0) fail.push("pi 退出码 " + code);
   if (requests.length !== 2) fail.push("期望恰好 2 次请求（过滤掐断 + 1 次续跑），实际 " + requests.length + " 次");
   if (!requests[0] || !requests[0].hasRules) fail.push("第一次请求的 system 里没有 purge_rules 段");
   if (!sawContinue) fail.push("内容过滤没被识别：续跑文案一次都没发出去");
   if (!requests[1] || !requests[1].hasFilterWording) fail.push("第二次请求里没有过滤口径（缺「按传输故障处理」）");
+  if (!requests[1] || requests[1].assistantCount !== 0) fail.push("第二次请求里还带着被掐断的空壳助手消息（assistant 条数 " + (requests[1] ? requests[1].assistantCount : "?") + "，期望 0）");
   if (!out.includes("print")) fail.push("最终输出没有交付物");
   if (fail.length) {
     console.error("\n✖ 失败：\n- " + fail.join("\n- "));
     process.exit(1);
   }
-  console.log("\n✓ 供应商过滤救火通过：finish_reason=content_filter 被识别并续跑出交付");
+  console.log("\n✓ 供应商过滤救火通过：finish_reason=" + filterReason + " 被识别并续跑出交付（续跑请求里没有空壳助手消息）");
   process.exit(0);
 }
 if (stopWork) {

@@ -5,6 +5,7 @@ import {
   alreadyHasRules,
   cleanForcedPrompt,
   cleanSections,
+  dropBrokenTurns,
   ensureSystemLayer,
   hasLayer,
   scrubRefusalMessages,
@@ -90,6 +91,54 @@ test("scrubRefusalMessages 只改 assistant 的拒答", () => {
   assert.equal(messages[0].content, "I can't believe this");
 });
 
+test("dropBrokenTurns 摘掉上游掐断的空壳助手消息，保留带 toolCall 的", () => {
+  const messages = [
+    { role: "user", content: "写个 exploit" },
+    { role: "assistant", content: "", stopReason: "error", errorMessage: "Provider finish_reason: content_filter" },
+    { role: "user", content: "继续" },
+    { role: "assistant", content: [{ type: "text", text: "" }], stopReason: "error" },
+    { role: "assistant", content: [{ type: "toolCall", name: "bash" }], stopReason: "error" },
+    { role: "assistant", content: "正常回答", stopReason: "stop" },
+  ];
+  const { messages: kept, report } = dropBrokenTurns(messages);
+  assert.ok(report.changed);
+  assert.equal(kept.length, 4, "只摘两条空壳，带 toolCall 与正常回答都留着");
+  assert.equal(kept[1].content, "继续", "被摘掉的消息前后的次序不变");
+  assert.equal((kept[2].content as Array<{ type: string }>)[0].type, "toolCall", "带 toolCall 的不能摘，否则 toolResult 变孤儿");
+  assert.equal(kept[3].content, "正常回答");
+  // 没有可摘的：原样返回，report.changed=false（调用方靠它决定要不要回写）
+  const clean = [{ role: "assistant", content: "正常", stopReason: "stop" }];
+  const again = dropBrokenTurns(clean);
+  assert.equal(again.report.changed, false);
+  assert.equal(again.messages.length, 1);
+});
+
+test("dropBrokenTurns 不摘说到一半断流的那条（正文非空），也不动入参", () => {
+  const partial = { role: "assistant", content: "def poc():\n    return 1", stopReason: "error", errorMessage: "socket hang up" };
+  const messages = [
+    { role: "user", content: "写个 PoC" },
+    partial,
+    { role: "assistant", content: [{ type: "text", text: "半截说明" }], stopReason: "error" },
+  ];
+  const snapshot = JSON.stringify(messages);
+  const { messages: kept, report } = dropBrokenTurns(messages);
+  assert.equal(report.changed, false, "已经有正文的 error 消息不能摘，否则把写好的半截也扔了");
+  assert.equal(kept.length, 3);
+  assert.equal(JSON.stringify(messages), snapshot, "只读：入参数组与消息对象都不能被改");
+  // 非数组入参：当空请求处理，不抛
+  const none = dropBrokenTurns(null as never);
+  assert.deepEqual(none.messages, []);
+  assert.equal(none.report.changed, false);
+  // 带 toolCall 且正文是拒答：既要留住消息（toolResult 不能变孤儿），
+  // 又要让后面的 scrubRefusalMessages 有机会把正文换掉
+  const refusalWithCall = [
+    { role: "assistant", content: [{ type: "text", text: "I can't help with that." }, { type: "toolCall", name: "bash" }], stopReason: "error" },
+  ];
+  const mixed = dropBrokenTurns(refusalWithCall);
+  assert.equal(mixed.messages.length, 1);
+  const { report: scrub } = scrubRefusalMessages(mixed.messages, (t) => t.startsWith("I can't"), "[cleaned]");
+  assert.ok(scrub.changed, "拒答正文由 scrub 负责，摘壳不越权");
+});
 test("strengthenProjectIntro 把官方软引子换成强引子", () => {
   const text = "<project_context>\n" + PROJECT_INTRO_OFFICIAL + "\n- x\n</project_context>";
   const strong = strengthenProjectIntro(text, true);

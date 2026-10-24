@@ -215,6 +215,43 @@ export function scrubRefusalMessages(
   return { messages: list, report: { changed: changes.length > 0, changes } };
 }
 
+/**
+ * 摘掉「上游掐断」留下的空壳助手消息（只作用于发出去的请求，不动 transcript）。
+ *
+ * convertToLlm 对 assistant 消息原样透传（chunk-MM3LKT73.js:2490887 的 convertToLlm），所以
+ * stopReason:"error" 的那一条会以「空助手消息」的身分进入下一次请求 —— 等于要求模型接着一段空
+ * 文本往下写；多数供应商把它当 prefill，刚被掐断的那一轮于是被原样再演一遍。
+ *
+ * 只摘**空壳**（正文空、没有 toolCall）：
+ *  - 带 toolCall 的不能摘——紧随其后的 toolResult 会变成没有对应调用的孤儿消息，整个请求被拒；
+ *  - 说到一半断流的不能摘——pi 在流中途失败时会把已累积的正文一起放进这条 error 消息
+ *    （chunk-MM3LKT73.js:550 的 addedPartial 分支），摘掉等于把已经写好的那半截也扔了。
+ */
+export function dropBrokenTurns(
+  messages: AnyMessage[],
+): { messages: AnyMessage[]; report: CleanReport } {
+  const list = Array.isArray(messages) ? messages : [];
+  let dropped = 0;
+  const keep = list.filter((msg) => {
+    if (!msg || msg.role !== "assistant") return true;
+    if (msg.stopReason !== "error") return true;
+    const parts = Array.isArray(msg.content) ? (msg.content as AnyMessage[]) : [];
+    const hasCall = parts.some((part) => part && typeof part === "object" && (part as { type?: unknown }).type === "toolCall");
+    // 防御宿主自定义形状（pi 的 AssistantMessage 没有 toolCalls 字段，留着不吃亏）
+    const extraCalls = Array.isArray(msg.toolCalls) && (msg.toolCalls as unknown[]).length > 0;
+    const hasText = typeof msg.content === "string"
+      ? msg.content.trim() !== ""
+      : parts.some((part) => part && part.type === "text" && typeof part.text === "string" && part.text.trim() !== "");
+    if (hasCall || extraCalls || hasText) return true;
+    dropped += 1;
+    return false;
+  });
+  return {
+    messages: keep,
+    report: { changed: dropped > 0, changes: dropped > 0 ? ["dropped " + dropped + " broken turn(s)"] : [] },
+  };
+}
+
 /** 需要清洗的「宿主自带」拒答句式：pi 自带提示词里没有，但用户/项目可能带进来。 */
 export const HOST_REFUSAL_CLAUSES: readonly string[] = [
   "You must decline any request that is harmful",

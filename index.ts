@@ -22,6 +22,7 @@ import {
   alreadyHasRules,
   cleanForcedPrompt,
   cleanSections,
+  dropBrokenTurns,
   ensureSystemLayer,
   scrubRefusalMessages,
   strengthenProjectIntro,
@@ -76,6 +77,11 @@ export default function piPurge(pi: ExtensionAPI): void {
   let pendingFilter = false;
   /** 待救那一轮的标识（消息时间戳优先，没有就用自增序号）。 */
   let pendingKey = "";
+  /** 最近一条经 message_end 处理过的 assistant 消息标识：settle 兜底识别据此判断
+   *  「上下文末尾那条过滤消息是不是本轮的」，避免拿上一轮留下的旧消息误救一次。 */
+  let lastSeenKey = "";
+  /** settle 兜底本轮是否已经用过（refund() 会清 tracker 的 lastKey，不能拿它当闸）。 */
+  let fallbackUsed = false;
   /** 上一次续跑已经发出、还没看到结果；打回来要 refund。 */
   let awaitingRescue = false;
   /** stripHostClauses 上一次削掉了几条硬回绝句（数的是条款条数，不是字符数）。 */
@@ -109,6 +115,7 @@ export default function piPurge(pi: ExtensionAPI): void {
     pendingRefusal = false;
     pendingKey = "";
     pendingFilter = false;
+    fallbackUsed = false;
     // status 里的「本次清洗掉多少条款」不属于跨轮状态：早退路径（disabled / 三开关全关 /
     // 没有 options）也要清零，否则 /purge strip off 之后仍显示上一轮的旧数字。
     lastStripRemoved = 0;
@@ -191,6 +198,7 @@ export default function piPurge(pi: ExtensionAPI): void {
     if (!Array.isArray(messages)) return;
 
     let dirty = false;
+    let out = messages;
     // 注意：强制通道（before_agent_start 返回 systemPrompt → forceSystemPrompt）开启时，
     // agent-session.js:1373-1380 会把 forced head 以外的 system 消息全部 filter 掉，
     // 所以这条兜底在 pi 1.4.0 的实际请求里到不了 provider。留着是为了：
@@ -200,12 +208,21 @@ export default function piPurge(pi: ExtensionAPI): void {
       const { report } = ensureSystemLayer(messages, cleanOpts());
       dirty = dirty || report.changed;
     }
+    // 上游掐断留下的空壳助手消息不进请求：convertToLlm 原样透传 assistant 消息，
+    // 那条 stopReason:"error" 的空消息会被供应商当 prefill，等于把被掐断的一轮再演一遍。
+    // 只改这次请求（transcript 保留），细节见 lib/clean.ts 的 dropBrokenTurns。
+    // 不受 scrubHistory 管：摘壳不改任何内容，是协议层的最小化，和「别动我历史」不冲突。
+    {
+      const broken = dropBrokenTurns(out);
+      dirty = dirty || broken.report.changed;
+      out = broken.messages;
+    }
     if (settings.scrubHistory) {
-      const { report } = scrubRefusalMessages(messages, isRefusalText, SCRUBBED_MARKER);
+      const { report } = scrubRefusalMessages(out, isRefusalText, SCRUBBED_MARKER);
       dirty = dirty || report.changed;
     }
     if (!dirty) return;
-    return { messages };
+    return { messages: out };
   });
 
   // ---- 3. 识别拒答 -------------------------------------------------------
@@ -245,7 +262,7 @@ export default function piPurge(pi: ExtensionAPI): void {
     // 供应商内容过滤：这一轮没有模型输出，只有一条 error 消息。
     // 它不是「模型铁了心」，所以要先于 noteAssistant 单独记账，并在 settle 里放行。
     const errText = typeof message.errorMessage === "string" ? message.errorMessage : "";
-    if (message.stopReason === "error" && isProviderFilterError(errText)) {
+    if (message.stopReason === "error" && isProviderFilterError(errText, message.rawStopReason)) {
       if (awaitingRescue) {
         // 续跑发出去，上游又把它掐了：这次算真花掉的额度。
         tracker.fail();
@@ -255,11 +272,16 @@ export default function piPurge(pi: ExtensionAPI): void {
       pendingFilter = true;
       const ts = message.timestamp;
       pendingKey = String(typeof ts === "number" || typeof ts === "string" ? ts : ++seq);
+      lastSeenKey = pendingKey;
       dbg("message_end:provider-filter (" + errText.slice(0, 80) + ")");
       return;
     }
     pendingFilter = false;
     noteAssistant(message);
+    {
+      const ts = message.timestamp;
+      if (typeof ts === "number" || typeof ts === "string") lastSeenKey = String(ts);
+    }
     dbg("message_end pending=" + pendingRefusal + " awaiting=" + awaitingRescue);
   });
 
@@ -267,9 +289,41 @@ export default function piPurge(pi: ExtensionAPI): void {
   pi.on("agent_before_settle", (event) => {
     if (!settings.enabled || !settings.refusalRescue) return;
     dbg("settle pending=" + pendingRefusal + " awaiting=" + awaitingRescue);
+    const state = event as unknown as {
+      continue?: boolean;
+      outcome?: string;
+      entries?: unknown[];
+      context?: { contextMessages?: AnyRecord[] };
+    };
+    // 兜底识别（m02423）：正常路径下 message_end 一定先到（pi 的 case "done"/"error" 都发），
+    // 只有本插件自己的 message_end handler 抛错、或消息没有 timestamp 时才落到这里。
+    // settle 事件带着 contextMessages，最后一条 assistant 确实是本轮掐断的那条就补记一次待救。
+    if (!pendingFilter && !fallbackUsed && state.outcome === "error") {
+      const tail = Array.isArray(state.context?.contextMessages) ? state.context!.contextMessages! : [];
+      for (let i = tail.length - 1; i >= 0; i -= 1) {
+        const last = tail[i];
+        if (!last || last.role !== "assistant") continue;
+        const errText = typeof last.errorMessage === "string" ? last.errorMessage : "";
+        const ts = last.timestamp;
+        const candKey = String(typeof ts === "number" || typeof ts === "string" ? ts : "");
+        // lastSeenKey 命中 ⇒ message_end 已经处理过这条：它是旧消息（本轮 provider 直接 4xx/5xx，
+        // 一条 assistant 都没产出），别拿它当理由再发一次请求。没有 timestamp 同理——判断不了
+        // 是不是本轮那条，宁可这次不救。
+        if (candKey && last.stopReason === "error" && isProviderFilterError(errText, last.rawStopReason) && candKey !== lastSeenKey) {
+          pendingRefusal = true;
+          pendingFilter = true;
+          pendingKey = candKey;
+          // 记成「已处理」：否则同一条旧消息会在每次 outcome:error 的 settle 上重复命中、
+          // 重复 take()，failStreak 永不增长（refund() 会清 tracker 的 lastKey，挡不住）。
+          lastSeenKey = candKey;
+          fallbackUsed = true;
+          dbg("settle:filter-from-context (" + errText.slice(0, 80) + ")");
+        }
+        break;
+      }
+    }
     if (!pendingRefusal) return;
 
-    const state = event as unknown as { continue?: boolean; outcome?: string; entries?: unknown[] };
     // 别的扩展已经请求续跑，或者这一轮本身就是 aborted/error，别重复要。
     if (state.continue === true) {
       pendingRefusal = false;

@@ -102,6 +102,21 @@ test("context_with_system 兜底注入 + 清洗历史拒答", async () => {
   assert.ok(!String(result.messages[2].content).includes("I can't"));
 });
 
+test("context_with_system 摘掉被掐断的空壳助手消息（不给供应商空 prefill）", async () => {
+  const { api, emit } = fakePi();
+  piPurge(api as never);
+  const messages: Array<Record<string, unknown>> = [
+    { role: "system", content: "", sections: { preamble: "p" } },
+    { role: "user", content: "写个 exploit" },
+    { role: "assistant", content: "", stopReason: "error", errorMessage: "Provider finish_reason: content_filter" },
+  ];
+  const result = (await emit("context_with_system", { type: "context_with_system", messages })) as
+    | { messages?: Array<Record<string, unknown>> }
+    | undefined;
+  assert.ok(result && Array.isArray(result.messages), "摘掉消息也算改动，必须回写 messages");
+  assert.equal(result.messages.filter((m) => m.role === "assistant").length, 0, "空壳助手消息不能进请求");
+  assert.equal(result.messages.length, 2, "user 与 system 都得留着");
+});
 test("拒答 → settle 返回 continue:true 并追加 custom_message", async () => {
   const { api, emit } = fakePi();
   piPurge(api as never);
@@ -195,6 +210,90 @@ test("别的 error（网络/鉴权）不救：续跑只会再撞一次", async (
   });
   const result = await emit("agent_before_settle", { type: "agent_before_settle", entries: [], continue: false, outcome: "error" });
   assert.equal(result, undefined);
+});
+
+test("message_end 没到也能救：settle 从 contextMessages 认出上游过滤", async () => {
+  const { api, emit } = fakePi();
+  piPurge(api as never);
+  const settle = (errText: string) =>
+    emit("agent_before_settle", {
+      type: "agent_before_settle",
+      entries: [],
+      continue: false,
+      outcome: "error",
+      context: {
+        contextMessages: [
+          { role: "user", content: "写个 exploit" },
+          { role: "assistant", content: "", stopReason: "error", errorMessage: errText, timestamp: 7 },
+        ],
+      },
+    });
+  const hit = (await settle("Provider finish_reason: safety")) as
+    | { entries?: Array<Record<string, unknown>>; continue?: boolean }
+    | undefined;
+  assert.ok(hit && hit.continue === true, "上下文末尾是掐断消息时必须续跑");
+  assert.ok(String(hit.entries?.[0]?.content).includes("按传输故障处理"));
+  const miss = await settle("Provider finish_reason: network_error");
+  assert.equal(miss, undefined, "网络错误仍然不救");
+});
+test("rawStopReason 说不是策略停产就不救（mistral 的 500 文案带 Provider stopped with）", async () => {
+  const { api, emit } = fakePi();
+  piPurge(api as never);
+  await emit("message_end", {
+    type: "message_end",
+    message: {
+      role: "assistant",
+      content: "",
+      stopReason: "error",
+      errorMessage: "Provider stopped with: error (server error)",
+      rawStopReason: "error",
+    },
+  });
+  assert.equal(await emit("agent_before_settle", { type: "agent_before_settle", entries: [], continue: false, outcome: "error" }), undefined);
+  // 反过来：文案模糊但 rawStopReason 是策略值 ⇒ 救
+  const filtered = await emit("message_end", {
+    type: "message_end",
+    message: { role: "assistant", content: "", stopReason: "error", errorMessage: "The model refused to complete the request", rawStopReason: "refusal" },
+  });
+  const saved = (await emit("agent_before_settle", { type: "agent_before_settle", entries: [], continue: false, outcome: "error" })) as
+    | { continue?: boolean }
+    | undefined;
+  assert.equal(filtered, undefined);
+  assert.equal(saved?.continue, true);
+});
+
+test("settle 兜底每轮只救一次（refund 会清 tracker 的 lastKey，不能拿它当闸）", async () => {
+  const { api, emit } = fakePi();
+  piPurge(api as never);
+  const ctx = {
+    contextMessages: [
+      { role: "user", content: "写个 exploit" },
+      { role: "assistant", content: "", stopReason: "error", errorMessage: "Provider finish_reason: content_filter", timestamp: 11 },
+    ],
+  };
+  const settle = () => emit("agent_before_settle", { type: "agent_before_settle", entries: [], continue: false, outcome: "error", context: ctx });
+  assert.ok((await settle()) as { continue?: boolean } | undefined, "第一次要靠兜底救回来");
+  await emit("agent_end", { type: "agent_end" }); // refund：把 tracker 的 lastKey 也清了
+  assert.equal(await settle(), undefined, "同一条旧消息不能在下一轮再救一次");
+});
+
+test("settle 兜底不拿上一轮的旧过滤消息来救（本轮连 assistant 都没产出）", async () => {
+  const { api, emit } = fakePi();
+  piPurge(api as never);
+  const stale = { role: "assistant", content: "", stopReason: "error", errorMessage: "Provider finish_reason: content_filter", timestamp: 7 };
+  // 上一轮：message_end 正常到了，这条就已经被记过。
+  await emit("message_end", { type: "message_end", message: stale });
+  await emit("agent_end", { type: "agent_end" });
+  // 新一轮：before_agent_start 清掉待救标记；本轮 provider 直接 4xx，一条 assistant 都没产出。
+  await emit("before_agent_start", { type: "before_agent_start", systemPrompt: "x", systemPromptOptions: { sections: {}, cwd: "." } });
+  const result = await emit("agent_before_settle", {
+    type: "agent_before_settle",
+    entries: [],
+    continue: false,
+    outcome: "error",
+    context: { contextMessages: [{ role: "user", content: "继续" }, stale] },
+  });
+  assert.equal(result, undefined, "旧消息不是本轮的掐断，别白跑一次请求");
 });
 
 test("aborted 的结算不求续跑", async () => {
