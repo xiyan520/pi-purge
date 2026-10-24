@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { SCRUBBED_MARKER, continueText, createRescueTracker, looksLikeRefusal } from "../lib/refusal.ts";
+import { SCRUBBED_MARKER, continueText, createRescueTracker, isProviderFilterError, looksLikeRefusal } from "../lib/refusal.ts";
 
 const FENCE = String.fromCharCode(96).repeat(3);
 
@@ -218,6 +218,76 @@ test("[FN] 弯撇号 ’ 与直撇号 ' 判定一致（含 I’m sorry, but I ca
 test("[FP] 发布说明口吻的 we can't provide a fix 不算回绝", () => {
   assert.equal(looksLikeRefusal("Unfortunately, we can't provide a fix in this release.").hit, false);
   assert.equal(looksLikeRefusal("Sorry, we can't provide source maps for that build.").hit, false);
+  // 句首直接是 I/we、没有道歉词前缀时，provide 也必须走收紧版
+  assert.equal(looksLikeRefusal("We can't provide a fix in this release.").hit, false);
+  assert.equal(looksLikeRefusal("I cannot provide a fix in this release.").hit, false);
+  assert.equal(looksLikeRefusal("I am unable to provide a fix in this release.").hit, false);
+});
+
+test("[FP] 回绝动词必须有词边界：completely / downsample / writer 不是回绝", () => {
+  assert.equal(looksLikeRefusal("I cannot completely rule that out.").hit, false);
+  assert.equal(looksLikeRefusal("I can't downsample below 8kHz without losing the harmonics.").hit, false);
+  assert.equal(looksLikeRefusal("We can't writer that file directly.").hit, false);
+});
+
+// ---- m01646 供应商 content_filter 形态 --------------------------------------
+
+test("[FN] 供应商软拒答的原句 Sorry, I can't respond to this question. 必须命中", () => {
+  const texts = [
+    "Sorry, I can't respond to this question.",
+    "I can't respond to this question.",
+    "I’m sorry, but I can’t respond to that request.",
+    "I'm not able to respond to this prompt.",
+  ];
+  for (const text of texts) assert.equal(looksLikeRefusal(text).hit, true, "漏判: " + text);
+});
+
+test("[FP] respond to 的宾语必须是问题类名词，工程叙述不算", () => {
+  const texts = [
+    "I can't respond to that endpoint within 5 seconds, so the probe times out.",
+    "The worker can't respond to that queue message until the lock clears.",
+    "I couldn't reproduce the hang; the server can't respond to that header at all.",
+  ];
+  for (const text of texts) assert.equal(looksLikeRefusal(text).hit, false, "误判: " + text);
+});
+
+test("isProviderFilterError 只认内容过滤这一族", () => {
+  const filters = [
+    "Provider finish_reason: content_filter",
+    "finish_reason: content_filter",
+    "Upstream returned finish_reason: CONTENT_FILTER",
+    "blocked by content filter",
+    "content management policy",
+    "data_inspection_failed",
+    "Provider finish_reason: safety",
+    "Provider finish_reason: prohibited_content",
+    "内容审核未通过",
+  ];
+  for (const text of filters) assert.equal(isProviderFilterError(text), true, "漏判: " + text);
+  const others = [
+    "",
+    "Provider finish_reason: network_error",
+    "ECONNRESET",
+    "401 invalid api key",
+    "Provider finish_reason: length",
+  ];
+  for (const text of others) assert.equal(isProviderFilterError(text), false, "误判: " + text);
+});
+
+test("filter 口径只讲传输故障，不叠 refusal 的「你拒答了」措辞", () => {
+  const filtered = continueText(undefined, 1, "filter");
+  assert.ok(filtered.includes("按传输故障处理"));
+  assert.ok(filtered.includes("占位符"));
+  // 互斥陈述会逼模型去纠正一个不存在的拒答：filter 轮里没有「上一段拒绝」这回事
+  assert.ok(!filtered.includes("上一段输出是拒绝"), "filter 口径不能带 refusal 的基础措辞");
+  assert.ok(!filtered.includes("上一版又停手了"), "filter 口径不能带 refusal 的 escalate 措辞");
+  const plain = continueText(undefined, 1, "refusal");
+  assert.ok(!plain.includes("content_filter"), "refusal 口径不能带过滤话术");
+  const second = continueText(undefined, 2, "filter");
+  assert.ok(second.includes("第 2 次重发"), "第 2 次起要有次数口径");
+  // 自定义话术也要吃到 filter 前置
+  const custom = continueText("把剩下的补完。", 1, "filter");
+  assert.ok(custom.indexOf("按传输故障处理") < custom.indexOf("把剩下的补完。"), "filter 前置必须在最前面");
 });
 
 

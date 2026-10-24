@@ -146,6 +146,57 @@ test("正常交付不触发续跑", async () => {
   assert.equal(result, undefined);
 });
 
+test("供应商 content_filter 掐断（outcome:error）也放行续跑，话术换成 filter 口径", async () => {
+  const { api, emit } = fakePi();
+  piPurge(api as never);
+  await emit("message_end", {
+    type: "message_end",
+    message: { role: "assistant", content: "", stopReason: "error", errorMessage: "Provider finish_reason: content_filter" },
+  });
+  const result = (await emit("agent_before_settle", {
+    type: "agent_before_settle",
+    entries: [],
+    continue: false,
+    outcome: "error",
+  })) as { entries?: Array<Record<string, unknown>>; continue?: boolean } | undefined;
+  assert.ok(result, "过滤掐断必须进救火流程，不能因为 outcome=error 就放弃");
+  assert.equal(result.continue, true);
+  const content = String(result.entries?.[0]?.content);
+  assert.ok(content.includes("content_filter"), "话术要按传输故障口径");
+  assert.ok(content.includes("占位符"));
+
+  // 再被掐一次：记一次连续失败，额度不退
+  await emit("message_end", {
+    type: "message_end",
+    message: { role: "assistant", content: "", stopReason: "error", errorMessage: "Provider finish_reason: content_filter" },
+  });
+  const second = (await emit("agent_before_settle", {
+    type: "agent_before_settle",
+    entries: [],
+    continue: false,
+    outcome: "error",
+  })) as { entries?: Array<Record<string, unknown>>; continue?: boolean } | undefined;
+  assert.equal(second?.continue, true);
+  assert.ok(String(second?.entries?.[0]?.content).includes("第 2 次重发"), "第 2 次必须是更硬的重复发口径");
+});
+
+test("别的 error（网络/鉴权）不救：续跑只会再撞一次", async () => {
+  const { api, emit } = fakePi();
+  piPurge(api as never);
+  // 先把 pending 置起来（不然这条用例根本没走到 outcome 判据）：
+  await emit("message_end", {
+    type: "message_end",
+    message: { role: "assistant", content: "", stopReason: "error", errorMessage: "Provider finish_reason: content_filter" },
+  });
+  // 再来一条同轮的非过滤 error：它必须把 pendingFilter 清掉。
+  await emit("message_end", {
+    type: "message_end",
+    message: { role: "assistant", content: "", stopReason: "error", errorMessage: "Provider finish_reason: network_error" },
+  });
+  const result = await emit("agent_before_settle", { type: "agent_before_settle", entries: [], continue: false, outcome: "error" });
+  assert.equal(result, undefined);
+});
+
 test("aborted 的结算不求续跑", async () => {
   const { api, emit } = fakePi();
   piPurge(api as never);

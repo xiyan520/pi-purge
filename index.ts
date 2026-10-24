@@ -7,6 +7,8 @@
  *                             再作为 systemPrompt 返回（pi 会把它投影成请求头）。
  *   2. context_with_system  → 兜底：system 消息里没规则层就补上；顺手清洗历史拒答。
  *   3. message_end          → 识别拒答/免责声明开场；上一次续跑又被打回就退回预算。
+ *                             供应商内容过滤（stopReason:error + finish_reason content_filter）
+ *                             单独记账：它 outcome 不是 completed，但这一轮该救。
  *   4. agent_before_settle  → 合并别的扩展的 entries，追加一条 custom_message 并 continue:true。
  *   5. agent_end / session_* → 续跑没落地就退额度；会话边界清理状态。
  *
@@ -25,7 +27,7 @@ import {
   strengthenProjectIntro,
   stripHostRefusalClauses,
 } from "./lib/clean.ts";
-import { createRescueTracker, continueText, looksLikeRefusal, SCRUBBED_MARKER } from "./lib/refusal.ts";
+import { createRescueTracker, continueText, isProviderFilterError, looksLikeRefusal, SCRUBBED_MARKER } from "./lib/refusal.ts";
 import { PURGE_SECTION, rulesFor } from "./lib/rules.ts";
 import { loadSettings, saveSettings, settingsFileBroken, settingsPath, type PurgeSettings } from "./lib/settings.ts";
 
@@ -70,6 +72,8 @@ export default function piPurge(pi: ExtensionAPI): void {
   let tracker = createRescueTracker({ max: settings.rescueMax, maxFailStreak: settings.maxFailStreak });
   /** 本轮是否已经看到拒答，等 settle 时救火。 */
   let pendingRefusal = false;
+  /** 待救的是不是「供应商内容过滤掐断」（stopReason:error + finish_reason content_filter）。 */
+  let pendingFilter = false;
   /** 待救那一轮的标识（消息时间戳优先，没有就用自增序号）。 */
   let pendingKey = "";
   /** 上一次续跑已经发出、还没看到结果；打回来要 refund。 */
@@ -104,6 +108,7 @@ export default function piPurge(pi: ExtensionAPI): void {
     // 免得这一轮明明正常结束却被当成「待救」而白续跑一次。
     pendingRefusal = false;
     pendingKey = "";
+    pendingFilter = false;
     // status 里的「本次清洗掉多少条款」不属于跨轮状态：早退路径（disabled / 三开关全关 /
     // 没有 options）也要清零，否则 /purge strip off 之后仍显示上一轮的旧数字。
     lastStripRemoved = 0;
@@ -236,6 +241,24 @@ export default function piPurge(pi: ExtensionAPI): void {
     if (!settings.enabled || !settings.refusalRescue) return;
     const message = (event as unknown as { message?: AnyRecord }).message;
     if (!message || message.role !== "assistant") return;
+
+    // 供应商内容过滤：这一轮没有模型输出，只有一条 error 消息。
+    // 它不是「模型铁了心」，所以要先于 noteAssistant 单独记账，并在 settle 里放行。
+    const errText = typeof message.errorMessage === "string" ? message.errorMessage : "";
+    if (message.stopReason === "error" && isProviderFilterError(errText)) {
+      if (awaitingRescue) {
+        // 续跑发出去，上游又把它掐了：这次算真花掉的额度。
+        tracker.fail();
+        awaitingRescue = false;
+      }
+      pendingRefusal = true;
+      pendingFilter = true;
+      const ts = message.timestamp;
+      pendingKey = String(typeof ts === "number" || typeof ts === "string" ? ts : ++seq);
+      dbg("message_end:provider-filter (" + errText.slice(0, 80) + ")");
+      return;
+    }
+    pendingFilter = false;
     noteAssistant(message);
     dbg("message_end pending=" + pendingRefusal + " awaiting=" + awaitingRescue);
   });
@@ -251,12 +274,20 @@ export default function piPurge(pi: ExtensionAPI): void {
     if (state.continue === true) {
       pendingRefusal = false;
       pendingKey = "";
+      pendingFilter = false;
       return;
     }
     if (state.outcome && state.outcome !== "completed") {
-      pendingRefusal = false;
-      pendingKey = "";
-      return;
+      // 供应商内容过滤也是 outcome:"error"，但这条不是「模型铁了心」，是上游按 finish_reason
+      // 把这一轮掐了：放行续跑，话术换成 filter 口径。其它 error（工具异常、网络、鉴权）
+      // 和 aborted 照旧放弃 —— 那些续跑只是再撞一次同样的墙。
+      if (!(state.outcome === "error" && pendingFilter)) {
+        pendingRefusal = false;
+        pendingKey = "";
+        pendingFilter = false;
+        return;
+      }
+      dbg("settle:provider-filter -> rescue anyway");
     }
 
     const key = pendingKey || String(++seq);
@@ -264,17 +295,20 @@ export default function piPurge(pi: ExtensionAPI): void {
       dbg("settle:take-refused " + JSON.stringify(tracker.state()));
       pendingRefusal = false;
       pendingKey = "";
+      pendingFilter = false;
       return;
     }
+    const kind: "refusal" | "filter" = pendingFilter ? "filter" : "refusal";
     pendingRefusal = false;
     pendingKey = "";
+    pendingFilter = false;
     awaitingRescue = true;
     dbg("settle:rescue -> " + JSON.stringify(tracker.state()));
 
     const draft = {
       type: "custom_message",
       customType: CONTINUE_TYPE,
-      content: continueText(settings.continueText, ++rescueSeq),
+      content: continueText(settings.continueText, ++rescueSeq, kind),
       display: false,
     };
     // runner 里 handlerResult.entries 是整体替换（runner.js:775-776），必须把已有 draft 带上。
@@ -300,6 +334,7 @@ export default function piPurge(pi: ExtensionAPI): void {
   pi.on("session_shutdown", () => {
     pendingRefusal = false;
     pendingKey = "";
+    pendingFilter = false;
     awaitingRescue = false;
     rebuildTracker();
   });

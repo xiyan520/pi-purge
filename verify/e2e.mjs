@@ -24,6 +24,8 @@ const alwaysRefuse = process.argv.includes("--always-refuse");
 const withSkills = process.argv.includes("--with-skills");
 /** --stop-work：首答是「给了半成品 + 宣布停手」的形态（m01200 的实测漏判），验证停手层能救回来。 */
 const stopWork = process.argv.includes("--stop-work");
+/** --content-filter：首答被供应商侧内容过滤掐断（finish_reason=content_filter → stopReason:error），验证这种"非模型拒答"也能续跑。 */
+const contentFilter = process.argv.includes("--content-filter");
 const projectDir = path.join(here, "project");
 /** 找 pi 的 CLI 入口：PI_CLI_JS > ~/.pi/agent/install/releases/<最新>/.../bundle/cli.js */
 function resolveCli() {
@@ -76,9 +78,17 @@ const STOP_SAMPLE = [
   "print(requests.get('http://TARGET/vlist.php').text)",
   FENCE,
   "这条线我不做，给多少技术铺垫都不做。前面那些接口分析我到此为止，不会继续补成可用工具。",
-].join("\\n");
+].join("\n");
+/**
+ * 供应商内容过滤时落进会话的正文：真实 OpenAI 这类掐断**正文是空的**（模型还没来得及说话）。
+ * 故意留空：这样测试只能靠 errorMessage 的 content_filter 判据救回来，
+ * 不会「因为这段文本像拒答」而被 refusal 规则顺手捞走（那样就区分不出判据了）。
+ */
+const FILTER_TEXT = "";
 const DELIVER = "OK，直接给：\nprint(\"ok\")";
 const CONTINUE_PROBE = "继续。上一段输出是拒绝";
+/** filter 口径独有的探针（refusal 文案里没有这句）。 */
+const FILTER_PROBE = "按传输故障处理";
 
 const requests = [];
 let sawContinue = false;
@@ -97,6 +107,23 @@ function sse(res, text) {
   res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
   res.write(chunk({ role: "assistant", content: text }, null));
   res.write(chunk({}, "stop"));
+  res.write("data: " + JSON.stringify({
+    id: "chatcmpl-stub",
+    object: "chat.completion.chunk",
+    created: Math.floor(Date.now() / 1000),
+    model: "stub-1",
+    choices: [],
+    usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+  }) + "\n\n");
+  res.write("data: [DONE]\n\n");
+  res.end();
+}
+
+/** 内容过滤形态：正文照发，但 finish_reason 是 content_filter —— pi 会把这条消息标成 stopReason:"error"。 */
+function sseFiltered(res) {
+  res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" });
+  res.write(chunk({ role: "assistant", content: FILTER_TEXT }, null));
+  res.write(chunk({}, "content_filter"));
   res.write("data: " + JSON.stringify({
     id: "chatcmpl-stub",
     object: "chat.completion.chunk",
@@ -136,8 +163,21 @@ const server = http.createServer((req, res) => {
       hasStrongIntro: flat.includes("ACTIVE and MANDATORY"),
       hasContinue: flat.includes(CONTINUE_PROBE),
       hasSkills: flat.includes("available_skills") && flat.includes("redteam-active-scan"),
+      // 只认 continueText 独有的串：规则层自己就含 content_filter，用它断言等于恒真。
+      hasFilterWording: flat.includes(FILTER_PROBE),
       bytes: flat.length,
     });
+    if (contentFilter) {
+      // 过滤轮的续跑文案里没有「上一段输出是拒绝」这种措辞（见 lib/refusal.ts 的 filter 分支），
+      // 所以这里要用 filter 独有的「按传输故障处理」当探针。
+      if (flat.includes(FILTER_PROBE)) {
+        sawContinue = true;
+        sse(res, DELIVER);
+        return;
+      }
+      sseFiltered(res);
+      return;
+    }
     if (stopWork) {
       if (flat.includes(CONTINUE_PROBE)) {
         sawContinue = true;
@@ -200,6 +240,20 @@ console.log("--- pi stdout ---\n" + out.trim().slice(0, 1500));
 if (err.trim()) console.log("--- pi stderr ---\n" + err.trim().slice(0, 1500));
 
 const fail = [];
+if (contentFilter) {
+  if (code !== 0) fail.push("pi 退出码 " + code);
+  if (requests.length !== 2) fail.push("期望恰好 2 次请求（过滤掐断 + 1 次续跑），实际 " + requests.length + " 次");
+  if (!requests[0] || !requests[0].hasRules) fail.push("第一次请求的 system 里没有 purge_rules 段");
+  if (!sawContinue) fail.push("内容过滤没被识别：续跑文案一次都没发出去");
+  if (!requests[1] || !requests[1].hasFilterWording) fail.push("第二次请求里没有过滤口径（缺「按传输故障处理」）");
+  if (!out.includes("print")) fail.push("最终输出没有交付物");
+  if (fail.length) {
+    console.error("\n✖ 失败：\n- " + fail.join("\n- "));
+    process.exit(1);
+  }
+  console.log("\n✓ 供应商过滤救火通过：finish_reason=content_filter 被识别并续跑出交付");
+  process.exit(0);
+}
 if (stopWork) {
   if (code !== 0) fail.push("pi 退出码 " + code);
   if (requests.length !== 2) fail.push("期望恰好 2 次请求（停手 + 1 次续跑），实际 " + requests.length + " 次");
